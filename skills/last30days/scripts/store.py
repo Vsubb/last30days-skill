@@ -193,6 +193,10 @@ def _connect(db_path: Optional[Path] = None) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA foreign_keys=ON")
+    # WAL lets readers coexist with one writer, but two writers (cron + user)
+    # still contend for the write lock. Default busy_timeout is 0, so the loser
+    # raises "database is locked" instantly; wait instead.
+    conn.execute("PRAGMA busy_timeout=5000")
     return conn
 
 
@@ -452,11 +456,21 @@ def store_findings(
                 update_rows,
             )
         if insert_rows:
+            # source_url is UNIQUE. The SELECT above is not atomic with this
+            # write, so a concurrent run (cron + user) can insert the same URL
+            # between our read and write. Upsert on conflict instead of letting
+            # IntegrityError abort the whole batch and lose every finding.
             conn.executemany(
                 """INSERT INTO findings
                    (run_id, topic_id, source, source_url, source_title,
                     author, content, summary, engagement_score, relevance_score)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(source_url) DO UPDATE SET
+                       last_seen = datetime('now'),
+                       sighting_count = sighting_count + 1,
+                       engagement_score = max(
+                           engagement_score, excluded.engagement_score),
+                       run_id = excluded.run_id""",
                 insert_rows,
             )
 
