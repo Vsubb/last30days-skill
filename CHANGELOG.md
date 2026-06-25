@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Advisory Semgrep SAST scan runs on every push/PR as part of the Security workflow, catching source-level security bugs using Semgrep CE community rules ([#563](https://github.com/mvanhorn/last30days-skill/issues/563))
+- MCP Go tests (`mcp/`) now run in CI on every push/PR alongside the Python test suite, so MCP server regressions are caught before merge ([#621](https://github.com/mvanhorn/last30days-skill/issues/621))
 
 ### Fixed
 
@@ -71,6 +72,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - The X FROM lane (the subject's own timeline) now pulls up to 8 posts per handle (was 3); the about/related lanes stay modest.
+
+### Fixed
+
+- Secrets `.env` and its parent config directory are now auto-tightened to `0o600`/`0o700` after creation, and `check-config.sh`'s `check_perms` now auto-fixes loose permissions with `chmod 600` instead of warning only ([#573](https://github.com/mvanhorn/last30days-skill/issues/573))
 
 ## [3.5.0] - 2026-06-18
 
