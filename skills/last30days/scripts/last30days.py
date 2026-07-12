@@ -48,7 +48,7 @@ if os.name == "nt":
 SCRIPT_DIR = Path(__file__).parent.resolve()
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from lib import dates, env, freshness, html_render, http, permission_preflight, pipeline, registers, render, schema, ui
+from lib import corpus, dates, env, freshness, html_render, http, permission_preflight, pipeline, registers, render, schema, ui
 
 _child_pids: set[int] = set()
 _child_pids_lock = threading.Lock()
@@ -121,6 +121,34 @@ def slugify(value: str) -> str:
     return slug or "last30days"
 
 
+def _report_has_private_corpus(report: schema.Report) -> bool:
+    items_by_source = getattr(report, "items_by_source", {})
+    if isinstance(items_by_source, dict) and items_by_source.get("corpus"):
+        return True
+    candidates = getattr(report, "ranked_candidates", ())
+    if not isinstance(candidates, (list, tuple)):
+        return False
+    return any(
+        candidate.source == "corpus"
+        or any(item.source == "corpus" for item in candidate.source_items)
+        for candidate in candidates
+    )
+
+
+def _ensure_output_directory(path: Path, *, private: bool) -> None:
+    if not private:
+        path.mkdir(parents=True, exist_ok=True)
+        return
+    missing: list[Path] = []
+    current = path
+    while not current.exists():
+        missing.append(current)
+        current = current.parent
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    for directory in missing:
+        directory.chmod(0o700)
+
+
 def save_output(
     report: schema.Report,
     emit: str,
@@ -131,10 +159,10 @@ def save_output(
     rendered_content: str | None = None,
     json_profile: str = "agent",
     register: str = "default",
+    private: bool | None = None,
 ) -> Path:
     from datetime import datetime
     path = Path(save_dir).expanduser().resolve()
-    path.mkdir(parents=True, exist_ok=True)
     slug = slugify(topic_override or report.topic)
     extension = "json" if emit == "json" else "html" if emit == "html" else "md"
     raw_label = "raw-html" if emit == "html" else "raw"
@@ -159,10 +187,16 @@ def save_output(
         )
     else:
         content = render.render_full(report)
+    private_corpus = _report_has_private_corpus(report) or bool(private)
+    _ensure_output_directory(path, private=private_corpus)
     encoded = content.encode("utf-8")
     for candidate in candidates:
         try:
-            fd = os.open(candidate, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            fd = os.open(
+                candidate,
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                0o600 if private_corpus else 0o644,
+            )
         except FileExistsError:
             continue
         with os.fdopen(fd, "wb") as f:
@@ -194,10 +228,25 @@ def save_output(
     )
 
 
-def save_rendered_output(rendered_content: str, output_file: str) -> Path:
+def save_rendered_output(
+    rendered_content: str,
+    output_file: str,
+    *,
+    private: bool = False,
+) -> Path:
     out_path = Path(output_file).expanduser().resolve()
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(rendered_content, encoding="utf-8")
+    _ensure_output_directory(out_path.parent, private=private)
+    if private and out_path.exists():
+        out_path.chmod(0o600)
+    fd = os.open(
+        out_path,
+        os.O_CREAT | os.O_TRUNC | os.O_WRONLY,
+        0o600 if private else 0o644,
+    )
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(rendered_content)
+    if private:
+        out_path.chmod(0o600)
     return out_path
 
 
@@ -384,14 +433,21 @@ def _scoped_store_db(args: argparse.Namespace) -> Path | None:
 def persist_report(report: schema.Report, store_db: Path | None = None) -> dict[str, int]:
     import store
 
+    private_corpus = _report_has_private_corpus(report)
     with store.scoped_db(store_db):
+        if private_corpus:
+            store.ensure_private_db_files()
         store.init_db()
+        if private_corpus:
+            store.ensure_private_db_files()
         topic_row = store.add_topic(report.topic)
         topic_id = topic_row["id"]
         source_mode = ",".join(sorted(report.items_by_source)) or "v3"
         run_id = store.record_run(topic_id, source_mode=source_mode, status="running")
         try:
             findings = store.findings_from_report(report)
+            if private_corpus:
+                store.ensure_private_db_files()
             counts = store.store_findings(run_id, topic_id, findings)
             store.update_run(
                 run_id,
@@ -403,6 +459,9 @@ def persist_report(report: schema.Report, store_db: Path | None = None) -> dict[
         except Exception as exc:
             store.update_run(run_id, status="failed", error_message=str(exc)[:500])
             raise
+        finally:
+            if private_corpus:
+                store.ensure_private_db_files()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -466,6 +525,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-browser-cookies", action="store_true",
                         help="Disable browser-cookie extraction even when FROM_BROWSER is configured")
     parser.add_argument("--save-dir", help="Optional directory for saving the rendered output")
+    parser.add_argument(
+        "--corpus",
+        action="append",
+        default=[],
+        metavar="DIR",
+        help="Add a local .md/.txt/.pdf directory as a private ranked source (repeatable)",
+    )
+    parser.add_argument(
+        "--corpus-all-time",
+        action="store_true",
+        help="Include matching corpus files older than the research window",
+    )
     parser.add_argument("--output", help="Optional exact file path for saving the rendered output")
     parser.add_argument("--synthesis-file", help="Markdown synthesis to embed in --emit=html output")
     parser.add_argument("--publish-html", action="store_true",
@@ -827,7 +898,12 @@ def _write_last_run(
         if env.CONFIG_DIR is None:
             return False
         target = env.CONFIG_DIR
-        target.mkdir(parents=True, exist_ok=True)
+        cached_reports = entity_reports or [(report.topic, report)]
+        has_private_corpus = any(
+            cached_report.items_by_source.get("corpus")
+            for _, cached_report in cached_reports
+        )
+        _ensure_output_directory(target, private=has_private_corpus)
         counts = {source: len(items) for source, items in report.items_by_source.items()}
         payload = {
             "topic": topic,
@@ -838,7 +914,6 @@ def _write_last_run(
             "comparison": bool(entity_reports),
         }
         (target / "last-run.json").write_text(json.dumps(payload, indent=2))
-        cached_reports = entity_reports or [(report.topic, report)]
         cache_payload = {
             "schema": REPORT_CACHE_VERSION,
             "topic": topic,
@@ -849,7 +924,10 @@ def _write_last_run(
                 for label, cached_report in cached_reports
             ],
         }
-        (target / "last-report.json").write_text(json.dumps(cache_payload, indent=2))
+        report_cache_path = target / "last-report.json"
+        report_cache_path.write_text(json.dumps(cache_payload, indent=2))
+        if has_private_corpus:
+            report_cache_path.chmod(0o600)
         return True
     except Exception as exc:
         # Never fatal, but never silent either (#787's lesson): callers that
@@ -1105,6 +1183,8 @@ def _run_drill(
                 if "trustpilot" in sources else None
             ),
             internal_subrun=True,
+            corpus_dirs=args.corpus,
+            corpus_all_time=args.corpus_all_time,
         )
     except Exception:
         progress.end_processing()
@@ -1388,9 +1468,18 @@ def _render_save_and_print(
             json_profile=args.json_profile,
             register=audience.name,
         )
+    has_private_corpus = _report_has_private_corpus(report) or bool(
+        entity_reports
+        and any(_report_has_private_corpus(entity) for _label, entity in entity_reports)
+    )
+    private_saved_format = has_private_corpus
     publish_companion_paths: list[Path] = []
     if args.output:
-        output_path = save_rendered_output(rendered, args.output)
+        output_path = save_rendered_output(
+            rendered,
+            args.output,
+            private=private_saved_format,
+        )
         if args.emit == "html":
             publish_companion_paths.append(output_path)
         sys.stderr.write(f"[last30days] Saved output to {output_path}\n")
@@ -1407,6 +1496,7 @@ def _render_save_and_print(
             rendered_content=rendered if is_comparison_html else None,
             json_profile=args.json_profile,
             register=audience.name,
+            private=private_saved_format,
         )
         if args.emit == "html":
             publish_companion_paths.append(save_path)
@@ -1421,6 +1511,7 @@ def _render_save_and_print(
                     suffix=args.save_suffix or "",
                     synthesis_md=synthesis_md,
                     json_profile=args.json_profile,
+                    private=_report_has_private_corpus(entity_report),
                 )
                 comparison_peer_paths.append(peer_path)
                 sys.stderr.write(f"[last30days] Saved output to {peer_path}\n")
@@ -1432,8 +1523,39 @@ def _render_save_and_print(
         sys.stderr.flush()
     if args.publish_html:
         try:
+            has_private_corpus = "corpus" in report.source_status or bool(
+                entity_reports
+                and any("corpus" in entity.source_status for _label, entity in entity_reports)
+            )
+            publish_rendered = rendered
+            if has_private_corpus:
+                sys.stderr.write(
+                    "[last30days] Excluding local corpus evidence and synthesis from published HTML.\n"
+                )
+                if entity_reports:
+                    publish_rendered = emit_comparison_output(
+                        [
+                            (label, schema.without_sources(entity, {"corpus"}))
+                            for label, entity in entity_reports
+                        ],
+                        "html",
+                        fun_level=fun_level,
+                        save_path=footer_save_path,
+                        synthesis_md=None,
+                        json_profile=args.json_profile,
+                    )
+                else:
+                    publish_rendered = emit_output(
+                        schema.without_sources(report, {"corpus"}),
+                        "html",
+                        fun_level=fun_level,
+                        save_path=footer_save_path,
+                        synthesis_md=None,
+                        json_profile=args.json_profile,
+                        register=audience.name,
+                    )
             publish_result = publish_rendered_html(
-                rendered,
+                publish_rendered,
                 password=_publish_password_for_args(args, config),
                 companion_paths=publish_companion_paths,
             )
@@ -1594,7 +1716,10 @@ def _run_library_feed(args: argparse.Namespace, config: dict[str, object]) -> in
     output_dir.mkdir(parents=True, exist_ok=True)
     library_id = library.get_or_create_library_id(output_dir)
     rendered_briefs_dir = output_dir / "briefs"
-    rendered_briefs_dir.mkdir(parents=True, exist_ok=True)
+    has_private_entries = any(
+        render.PRIVATE_CORPUS_START in entry.content for entry in entries
+    )
+    _ensure_output_directory(rendered_briefs_dir, private=has_private_entries)
 
     def _preserve_hand_written_page(existing_path: Path, generated_marker: str) -> None:
         """Back up any page library feed did not generate before overwriting it."""
@@ -1617,13 +1742,19 @@ def _run_library_feed(args: argparse.Namespace, config: dict[str, object]) -> in
             f"library feed; preserved the original at {backup.name}\n"
         )
 
-    brief_documents: dict[str, str] = {}
+    publishable_brief_documents: dict[str, str] = {}
     for entry in entries:
         rendered = html_render.render_library_brief(entry)
         target = rendered_briefs_dir / entry.output_name
         _preserve_hand_written_page(target, html_render.LIBRARY_BRIEF_MARKER)
-        target.write_text(rendered, encoding="utf-8")
-        brief_documents[entry.entry_id] = rendered
+        save_rendered_output(
+            rendered,
+            str(target),
+            private=render.PRIVATE_CORPUS_START in entry.content,
+        )
+        publishable_brief_documents[entry.entry_id] = html_render.render_library_brief(
+            entry, include_private=False
+        )
 
     current_brief_names = {entry.output_name for entry in entries}
     for path in rendered_briefs_dir.glob("*.html"):
@@ -1664,7 +1795,7 @@ def _run_library_feed(args: argparse.Namespace, config: dict[str, object]) -> in
         entry_urls: dict[str, str] = {}
         try:
             brief_results = html_publish.publish_html_documents(
-                brief_documents,
+                publishable_brief_documents,
                 password=password,
             )
             entry_urls = {
@@ -1810,6 +1941,23 @@ def _main(
         )
         return 2
     config = env.get_config(policy=_config_policy_for_args(args, topic, extra_argv))
+    resolved_corpus_dirs = corpus.resolve_directories(
+        args.corpus, config.get("LAST30DAYS_CORPUS_DIRS")
+    )
+    # EXCLUDE_SOURCES=corpus disables corpus retrieval entirely; the hosted
+    # privacy bypass below must use the same predicate, or hosted users with
+    # configured-but-excluded dirs silently lose the remote backend.
+    excluded_sources = {
+        value.strip().lower()
+        for value in str(config.get("EXCLUDE_SOURCES") or "").split(",")
+        if value.strip()
+    }
+    if "corpus" in excluded_sources:
+        resolved_corpus_dirs = []
+    if resolved_corpus_dirs:
+        config["_CORPUS_DIRS"] = [str(path) for path in resolved_corpus_dirs]
+    if _config_truthy(config.get("LAST30DAYS_CORPUS_IN_EXPORT")):
+        config["_CORPUS_IN_EXPORT"] = True
     _propagate_config_to_environ(config)
 
     # Env-var fallback for --save-dir, mirroring the LAST30DAYS_STORE pattern below.
@@ -1981,11 +2129,21 @@ def _main(
     # to local-only runs - there is no built-in endpoint.
     if (
         topic
+        and resolved_corpus_dirs
+        and env.read_secret_env("LAST30DAYS_API_KEY")
+        and os.environ.get("LAST30DAYS_API_BASE")
+    ):
+        sys.stderr.write(
+            "[last30days] Local corpus configured; bypassing the hosted backend so files stay on this machine.\n"
+        )
+    if (
+        topic
         and not args.diagnose
         and not args.mock
         and not args.record_fixtures
         and env.read_secret_env("LAST30DAYS_API_KEY")
         and os.environ.get("LAST30DAYS_API_BASE")
+        and not resolved_corpus_dirs
     ):
         if _freshness_enabled(args, config):
             if args.verify_freshness is True:
@@ -2238,6 +2396,8 @@ def _main(
                 internal_subrun=comp_enabled,
                 hiring_signals_mode=args.hiring_signals,
                 save_dir=args.save_dir,
+                corpus_dirs=args.corpus,
+                corpus_all_time=args.corpus_all_time,
             )
             r.artifacts["resolved"] = {
                 "entity": topic,
@@ -2375,6 +2535,8 @@ def _main(
                     hiring_signals_mode=args.hiring_signals,
                     internal_subrun=True,
                     save_dir=args.save_dir,
+                    corpus_dirs=args.corpus,
+                    corpus_all_time=args.corpus_all_time,
                 )
                 report.artifacts["resolved"] = resolved_effective
                 return report
